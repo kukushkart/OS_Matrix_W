@@ -4,13 +4,14 @@
 #include <thread>
 #include <windows.h>
 #include <iomanip>
+#include <mutex>
+#include <memory>
 
 using namespace std;
 using namespace chrono;
 
 const int N = 50;
 
-// Инициализация матрицы случайными значениями
 void initMatrix(vector<vector<double>>& matrix) {
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
@@ -19,7 +20,12 @@ void initMatrix(vector<vector<double>>& matrix) {
     }
 }
 
-//однопоточное
+void clearMatrix(vector<vector<double>>& matrix) {
+    for (int i = 0; i < N; i++) {
+        fill(matrix[i].begin(), matrix[i].end(), 0.0);
+    }
+}
+
 void multiplySimple(const vector<vector<double>>& A,
     const vector<vector<double>>& B,
     vector<vector<double>>& C) {
@@ -33,44 +39,80 @@ void multiplySimple(const vector<vector<double>>& A,
     }
 }
 
-void multiplyBlock(const vector<vector<double>>& A,
+void multiplyBlockKernel(const vector<vector<double>>& A,
     const vector<vector<double>>& B,
     vector<vector<double>>& C,
     int rowStart, int rowEnd,
-    int colStart, int colEnd) {
+    int colStart, int colEnd,
+    int innerStart, int innerEnd,
+    mutex* mtx,
+    CRITICAL_SECTION* cs) {
+
+    int h = rowEnd - rowStart;
+    int w = colEnd - colStart;
+    vector<vector<double>> localRes(h, vector<double>(w, 0.0));
+
     for (int i = rowStart; i < rowEnd; i++) {
         for (int j = colStart; j < colEnd; j++) {
             double sum = 0;
-            for (int k = 0; k < N; k++) {
+            for (int k = innerStart; k < innerEnd; k++) {
                 sum += A[i][k] * B[k][j];
             }
-            C[i][j] = sum;
+            localRes[i - rowStart][j - colStart] = sum;
         }
     }
-}
 
+    if (mtx) mtx->lock();
+    if (cs) EnterCriticalSection(cs);
+
+    for (int i = rowStart; i < rowEnd; i++) {
+        for (int j = colStart; j < colEnd; j++) {
+            C[i][j] += localRes[i - rowStart][j - colStart];
+        }
+    }
+
+    if (cs) LeaveCriticalSection(cs);
+    if (mtx) mtx->unlock();
+}
 
 void multiplyThreadStd(const vector<vector<double>>& A,
     const vector<vector<double>>& B,
     vector<vector<double>>& C,
     int blockSize) {
+
     vector<thread> threads;
     int numBlocks = (N + blockSize - 1) / blockSize;
 
+    vector<unique_ptr<mutex>> mutexes;
+    for (int i = 0; i < numBlocks * numBlocks; ++i) {
+        mutexes.push_back(make_unique<mutex>());
+    }
+
     for (int i = 0; i < numBlocks; i++) {
         for (int j = 0; j < numBlocks; j++) {
-            int rowStart = i * blockSize;
-            int rowEnd = min((i + 1) * blockSize, N);
-            int colStart = j * blockSize;
-            int colEnd = min((j + 1) * blockSize, N);
+            for (int k = 0; k < numBlocks; k++) {
 
-            threads.emplace_back(multiplyBlock, ref(A), ref(B), ref(C),
-                rowStart, rowEnd, colStart, colEnd);
+                int rowStart = i * blockSize;
+                int rowEnd = min((i + 1) * blockSize, N);
+
+                int colStart = j * blockSize;
+                int colEnd = min((j + 1) * blockSize, N);
+
+                int innerStart = k * blockSize;
+                int innerEnd = min((k + 1) * blockSize, N);
+
+                mutex* mtx = mutexes[i * numBlocks + j].get();
+
+                threads.emplace_back(multiplyBlockKernel,
+                    ref(A), ref(B), ref(C),
+                    rowStart, rowEnd, colStart, colEnd, innerStart, innerEnd,
+                    mtx, nullptr);
+            }
         }
     }
 
     for (auto& t : threads) {
-        t.join();
+        if (t.joinable()) t.join();
     }
 }
 
@@ -80,12 +122,15 @@ struct BlockParams {
     vector<vector<double>>* C;
     int rowStart, rowEnd;
     int colStart, colEnd;
+    int innerStart, innerEnd;
+    CRITICAL_SECTION* cs;
 };
 
-DWORD WINAPI multiplyBlockWin(LPVOID param) {
+DWORD WINAPI multiplyBlockWinWrapper(LPVOID param) {
     BlockParams* p = (BlockParams*)param;
-    multiplyBlock(*(p->A), *(p->B), *(p->C),
-        p->rowStart, p->rowEnd, p->colStart, p->colEnd);
+    multiplyBlockKernel(*(p->A), *(p->B), *(p->C),
+        p->rowStart, p->rowEnd, p->colStart, p->colEnd,
+        p->innerStart, p->innerEnd, nullptr, p->cs);
     delete p;
     return 0;
 }
@@ -94,36 +139,58 @@ void multiplyThreadWin(const vector<vector<double>>& A,
     const vector<vector<double>>& B,
     vector<vector<double>>& C,
     int blockSize) {
+
     vector<HANDLE> threads;
     int numBlocks = (N + blockSize - 1) / blockSize;
 
+    vector<CRITICAL_SECTION> css(numBlocks * numBlocks);
+    for (auto& cs : css) {
+        InitializeCriticalSection(&cs);
+    }
+
     for (int i = 0; i < numBlocks; i++) {
         for (int j = 0; j < numBlocks; j++) {
-            BlockParams* p = new BlockParams;
-            p->A = &A;
-            p->B = &B;
-            p->C = &C;
-            p->rowStart = i * blockSize;
-            p->rowEnd = min((i + 1) * blockSize, N);
-            p->colStart = j * blockSize;
-            p->colEnd = min((j + 1) * blockSize, N);
+            for (int k = 0; k < numBlocks; k++) {
 
-            HANDLE hThread = CreateThread(NULL, 0, multiplyBlockWin, p, 0, NULL);
-            threads.push_back(hThread);
+                BlockParams* p = new BlockParams;
+                p->A = &A; p->B = &B; p->C = &C;
+                p->rowStart = i * blockSize;
+                p->rowEnd = min((i + 1) * blockSize, N);
+                p->colStart = j * blockSize;
+                p->colEnd = min((j + 1) * blockSize, N);
+                p->innerStart = k * blockSize;
+                p->innerEnd = min((k + 1) * blockSize, N);
+                p->cs = &css[i * numBlocks + j];
+
+                HANDLE hThread = CreateThread(NULL, 0, multiplyBlockWinWrapper, p, 0, NULL);
+                if (hThread != NULL) {
+                    threads.push_back(hThread);
+                }
+                else {
+                    delete p;
+                }
+            }
         }
     }
 
-    WaitForMultipleObjects(threads.size(), threads.data(), TRUE, INFINITE);
+    const int MAX_WAIT = 64;
+    for (size_t i = 0; i < threads.size(); i += MAX_WAIT) {
+        int count = min((int)(threads.size() - i), MAX_WAIT);
+        WaitForMultipleObjects(count, threads.data() + i, TRUE, INFINITE);
+    }
 
     for (auto h : threads) {
         CloseHandle(h);
     }
-}
 
+    for (auto& cs : css) {
+        DeleteCriticalSection(&cs);
+    }
+}
 
 int main() {
     setlocale(LC_ALL, "Russian");
-    srand(time(0));
+    srand((unsigned int)time(0));
 
     vector<vector<double>> A(N, vector<double>(N));
     vector<vector<double>> B(N, vector<double>(N));
@@ -132,18 +199,22 @@ int main() {
     initMatrix(A);
     initMatrix(B);
 
-    cout << "\nОднопоточное умножение" << endl;
+    cout << "Р Р°Р·РјРµСЂ РјР°С‚СЂРёС†С‹: " << N << "x" << N << endl;
+    cout << "РћРґРЅРѕРїРѕС‚РѕС‡РЅРѕРµ СѓРјРЅРѕР¶РµРЅРёРµ " << endl;
+
     auto start = high_resolution_clock::now();
     multiplySimple(A, B, C);
     auto end = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end - start).count();
-    cout << "Время: " << duration << " мс" << endl;
+    auto durationSimple = duration_cast<milliseconds>(end - start).count();
 
-    cout << left << setw(15) << "Размер блока"
-        << setw(15) << "Кол-во блоков"
-        << setw(20) << "std::thread (мс)"
-        << setw(20) << "WinAPI (мс)"
+    cout << "Р’СЂРµРјСЏ (РѕРґРёРЅ РїРѕС‚РѕРє): " << durationSimple << " РјСЃ" << endl << endl;
+
+    cout << left << setw(15) << "Р Р°Р·РјРµСЂ Р±Р»РѕРєР°"
+        << setw(15) << "РљРѕР»-РІРѕ РїРѕС‚РѕРєРѕРІ"
+        << setw(20) << "std::thread (РјСЃ)"
+        << setw(20) << "WinAPI (РјСЃ)"
         << endl;
+    cout << endl;
 
     vector<int> blockSizes;
     for (int k = 1; k <= N; k *= 2) {
@@ -155,25 +226,33 @@ int main() {
 
     for (int blockSize : blockSizes) {
         int numBlocks = (N + blockSize - 1) / blockSize;
-        int totalBlocks = numBlocks * numBlocks;
+        long long totalThreads = (long long)numBlocks * numBlocks * numBlocks;
 
-        // std::thread
+        if (totalThreads > 5000) {
+            cout << left << setw(15) << blockSize
+                << setw(15) << totalThreads
+                << setw(40) << "РЎР»РёС€РєРѕРј РјРЅРѕРіРѕ РїРѕС‚РѕРєРѕРІ (skip)" << endl;
+            continue;
+        }
+
+        clearMatrix(C);
         start = high_resolution_clock::now();
         multiplyThreadStd(A, B, C, blockSize);
         end = high_resolution_clock::now();
         auto timeStd = duration_cast<milliseconds>(end - start).count();
 
-        // WinAPI
+        clearMatrix(C);
         start = high_resolution_clock::now();
         multiplyThreadWin(A, B, C, blockSize);
         end = high_resolution_clock::now();
         auto timeWin = duration_cast<milliseconds>(end - start).count();
 
         cout << left << setw(15) << blockSize
-            << setw(15) << totalBlocks
+            << setw(15) << totalThreads
             << setw(20) << timeStd
             << setw(20) << timeWin
             << endl;
     }
+
     return 0;
 }
